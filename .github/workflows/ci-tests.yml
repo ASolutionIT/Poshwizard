@@ -144,13 +144,7 @@ jobs:
         $errors = @()
         Get-ChildItem -Path PoshWizard -Recurse -Filter *.ps1 | ForEach-Object {
           try {
-            $content = Get-Content $_.FullName -Raw
-            $tokens = @()
-            $parseErrors = @()
-            [void][System.Management.Automation.PSParser]::Tokenize($content, [ref]$tokens, [ref]$parseErrors)
-            if ($parseErrors.Count -gt 0) {
-              $errors += "$($_.Name): $($parseErrors -join '; ')"
-            }
+            $null = [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$null)
           } catch {
             $errors += "$($_.Name): $_"
           }
