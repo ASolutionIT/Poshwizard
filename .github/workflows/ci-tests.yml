@@ -1,0 +1,251 @@
+name: CI Tests
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+  workflow_dispatch:
+
+jobs:
+  powershell-tests:
+    name: PowerShell Integration Tests
+    runs-on: windows-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      
+    - name: Setup PowerShell
+      shell: pwsh
+      run: |
+        Write-Host "PowerShell Version: $($PSVersionTable.PSVersion)"
+        Write-Host "OS: $($PSVersionTable.OS)"
+        
+    - name: Run Module Loading Tests
+      shell: pwsh
+      run: |
+        cd Tests
+        .\Integration\Test-ModuleLoading.ps1
+        
+    - name: Run Demo Script Tests
+      shell: pwsh
+      run: |
+        cd Tests
+        .\Integration\Test-DemoScripts.ps1 -SkipInteractive
+        
+    - name: Run All Integration Tests
+      shell: pwsh
+      run: |
+        cd Tests
+        .\Run-AllTests.ps1 -SkipInteractive
+        
+    - name: Upload Test Results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: powershell-test-results
+        path: Tests/**/*.log
+
+  csharp-tests:
+    name: C# Unit Tests
+    runs-on: windows-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v3
+      with:
+        dotnet-version: '6.0.x'
+        
+    - name: Restore dependencies
+      run: dotnet restore WizardFramework.sln
+      
+    - name: Build solution
+      run: dotnet build WizardFramework.sln --configuration Debug --no-restore
+      
+    - name: Run xUnit tests
+      run: dotnet test WizardFramework.sln --configuration Debug --no-build --verbosity normal --logger "trx;LogFileName=test-results.trx"
+      
+    - name: Upload Test Results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: csharp-test-results
+        path: '**/TestResults/*.trx'
+
+  build-validation:
+    name: Build Validation
+    runs-on: windows-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v3
+      with:
+        dotnet-version: '6.0.x'
+        
+    - name: Build Debug
+      run: dotnet build WizardFramework.sln --configuration Debug
+      
+    - name: Build Release
+      run: dotnet build WizardFramework.sln --configuration Release
+      
+    - name: Verify PoshWizard.exe exists
+      shell: pwsh
+      run: |
+        $exePath = "PoshWizard\bin\PoshWizard.exe"
+        if (Test-Path $exePath) {
+          Write-Host "SUCCESS: PoshWizard.exe found at $exePath" -ForegroundColor Green
+        } else {
+          Write-Host "ERROR: PoshWizard.exe not found at $exePath" -ForegroundColor Red
+          exit 1
+        }
+        
+    - name: Upload Build Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-artifacts
+        path: |
+          PoshWizard/bin/PoshWizard.exe
+          PoshWizard/*.psd1
+          PoshWizard/*.psm1
+
+  module-validation:
+    name: Module Validation
+    runs-on: windows-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      
+    - name: Test Module Manifest
+      shell: pwsh
+      run: |
+        $manifestPath = "PoshWizard\PoshWizard.psd1"
+        try {
+          $manifest = Test-ModuleManifest -Path $manifestPath -ErrorAction Stop
+          Write-Host "SUCCESS: Module manifest is valid" -ForegroundColor Green
+          Write-Host "  Version: $($manifest.Version)"
+          Write-Host "  Author: $($manifest.Author)"
+          Write-Host "  Functions: $($manifest.ExportedFunctions.Count)"
+        } catch {
+          Write-Host "ERROR: Module manifest validation failed: $_" -ForegroundColor Red
+          exit 1
+        }
+        
+    - name: Test PowerShell Script Syntax
+      shell: pwsh
+      run: |
+        $errors = @()
+        Get-ChildItem -Path PoshWizard -Recurse -Filter *.ps1 | ForEach-Object {
+          try {
+            $content = Get-Content $_.FullName -Raw
+            $tokens = @()
+            $parseErrors = @()
+            [void][System.Management.Automation.PSParser]::Tokenize($content, [ref]$tokens, [ref]$parseErrors)
+            if ($parseErrors.Count -gt 0) {
+              $errors += "$($_.Name): $($parseErrors -join '; ')"
+            }
+          } catch {
+            $errors += "$($_.Name): $_"
+          }
+        }
+        if ($errors.Count -gt 0) {
+          Write-Host "ERROR: Script syntax errors found:" -ForegroundColor Red
+          $errors | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
+          exit 1
+        } else {
+          Write-Host "SUCCESS: All scripts have valid syntax" -ForegroundColor Green
+        }
+
+  security-scan:
+    name: Security Scan
+    runs-on: windows-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      
+    - name: Scan for Sensitive Data
+      shell: pwsh
+      run: |
+        $patterns = @(
+          'password\s*=\s*[''"].+[''"]'
+          'api[_-]?key\s*=\s*[''"].+[''"]'
+          'secret\s*=\s*[''"].+[''"]'
+          'token\s*=\s*[''"].+[''"]'
+        )
+        
+        $findings = @()
+        Get-ChildItem -Recurse -Include *.ps1,*.cs,*.xaml | ForEach-Object {
+          $content = Get-Content $_.FullName -Raw
+          foreach ($pattern in $patterns) {
+            if ($content -match $pattern) {
+              $findings += "$($_.Name): Potential sensitive data found"
+            }
+          }
+        }
+        
+        if ($findings.Count -gt 0) {
+          Write-Host "WARNING: Potential sensitive data found:" -ForegroundColor Yellow
+          $findings | ForEach-Object { Write-Host "  $_" -ForegroundColor Yellow }
+        } else {
+          Write-Host "SUCCESS: No sensitive data patterns detected" -ForegroundColor Green
+        }
+        
+    - name: Check for Hardcoded Paths
+      shell: pwsh
+      run: |
+        $findings = @()
+        Get-ChildItem -Recurse -Include *.ps1 -Exclude *Test*.ps1 | ForEach-Object {
+          $content = Get-Content $_.FullName -Raw
+          if ($content -match 'C:\\[^"'']+' -or $content -match 'D:\\[^"'']+') {
+            $findings += "$($_.Name): Potential hardcoded path found"
+          }
+        }
+        
+        if ($findings.Count -gt 0) {
+          Write-Host "WARNING: Potential hardcoded paths found:" -ForegroundColor Yellow
+          $findings | ForEach-Object { Write-Host "  $_" -ForegroundColor Yellow }
+        } else {
+          Write-Host "SUCCESS: No hardcoded paths detected" -ForegroundColor Green
+        }
+
+  summary:
+    name: Test Summary
+    runs-on: windows-latest
+    needs: [powershell-tests, csharp-tests, build-validation, module-validation, security-scan]
+    if: always()
+    
+    steps:
+    - name: Check Results
+      shell: pwsh
+      run: |
+        Write-Host "========================================" -ForegroundColor Cyan
+        Write-Host "  CI/CD Test Summary" -ForegroundColor Cyan
+        Write-Host "========================================" -ForegroundColor Cyan
+        
+        $psTests = "${{ needs.powershell-tests.result }}"
+        $csTests = "${{ needs.csharp-tests.result }}"
+        $build = "${{ needs.build-validation.result }}"
+        $module = "${{ needs.module-validation.result }}"
+        $security = "${{ needs.security-scan.result }}"
+        
+        Write-Host "PowerShell Tests: $psTests" -ForegroundColor $(if ($psTests -eq 'success') { 'Green' } else { 'Red' })
+        Write-Host "C# Unit Tests: $csTests" -ForegroundColor $(if ($csTests -eq 'success') { 'Green' } else { 'Red' })
+        Write-Host "Build Validation: $build" -ForegroundColor $(if ($build -eq 'success') { 'Green' } else { 'Red' })
+        Write-Host "Module Validation: $module" -ForegroundColor $(if ($module -eq 'success') { 'Green' } else { 'Red' })
+        Write-Host "Security Scan: $security" -ForegroundColor $(if ($security -eq 'success') { 'Green' } else { 'Red' })
+        Write-Host "========================================" -ForegroundColor Cyan
+        
+        if ($psTests -ne 'success' -or $csTests -ne 'success' -or $build -ne 'success' -or $module -ne 'success') {
+          Write-Host "RESULT: FAILED" -ForegroundColor Red
+          exit 1
+        } else {
+          Write-Host "RESULT: PASSED" -ForegroundColor Green
+        }
